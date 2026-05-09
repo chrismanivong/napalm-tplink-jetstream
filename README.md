@@ -2,6 +2,14 @@
 
 NAPALM community driver for **TP-Link Jetstream** managed switches (T1500G, T1600G, T2600G, T3700G and compatible series).
 
+## Tested devices
+
+| Model | Series | Tested |
+|---|---|---|
+| TL-SG2210P | Jetstream Smart | ✅ |
+
+> More devices from the T1500G, T1600G, T2600G and T3700G series should work as well — contributions welcome.
+
 ## Requirements
 
 | Dependency | Minimum version |
