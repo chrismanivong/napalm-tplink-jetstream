@@ -25,7 +25,7 @@ import netaddr
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
 
-from napalm.base import NetworkDriver
+from napalm_device_types import SwitchDriver
 from napalm.base import helpers as napalm_helpers
 from napalm.base.exceptions import (
     ConnectionException,
@@ -38,7 +38,7 @@ from napalm.base.netmiko_helpers import netmiko_args
 import napalm.base.constants as C
 
 
-class TPLinkJetstreamDriver(NetworkDriver):
+class TPLinkJetstreamDriver(SwitchDriver):
     """NAPALM driver for TP-Link Jetstream managed switches."""
 
     VENDOR = "TP-Link"
@@ -633,14 +633,34 @@ class TPLinkJetstreamDriver(NetworkDriver):
             if not re.match(r"^(?:Gi|Te|Fa|Lag)\S+", parts[0], re.I):
                 continue
 
+            # Port ID can be "gigabitEthernet X/X/X" (two tokens) when the
+            # neighbor is another TP-Link switch — detect and normalise to short form.
+            PORT_TYPE_MAP = {
+                "gigabitethernet": "Gi",
+                "fastethernet": "Fa",
+                "tengigabitethernet": "Te",
+            }
+            idx = 2  # parts[idx] is Port ID
+            if len(parts) > idx and parts[idx].lower() in PORT_TYPE_MAP and len(parts) > idx + 1:
+                short = PORT_TYPE_MAP[parts[idx].lower()]
+                port_id = f"{short}{parts[idx + 1]}"
+                shift = 1
+            else:
+                port_id = parts[idx] if len(parts) > idx else ""
+                shift = 0
+
+            # Port Description (column 4+shift) may also be "gigabitEthernet X/X/X"
+            pd_idx = 4 + shift
+            desc_shift = 1 if (len(parts) > pd_idx and parts[pd_idx].lower() in PORT_TYPE_MAP) else 0
+
             rows.append(
                 {
                     "local_port": parts[0],
                     "remote_chassis_id": parts[1] if len(parts) > 1 else "",
-                    "port_id": parts[2] if len(parts) > 2 else "",
-                    "mgmt_address": parts[3] if len(parts) > 3 else "",
-                    "port_description": parts[4] if len(parts) > 4 else "",
-                    "system_name": parts[5] if len(parts) > 5 else "",
+                    "port_id": port_id,
+                    "mgmt_address": parts[3 + shift] if len(parts) > 3 + shift else "",
+                    "port_description": parts[pd_idx] if len(parts) > pd_idx else "",
+                    "system_name": parts[5 + shift + desc_shift] if len(parts) > 5 + shift + desc_shift else "",
                 }
             )
 
@@ -783,6 +803,101 @@ class TPLinkJetstreamDriver(NetworkDriver):
                 elif re.match(r"^(?:Gi|Te|Fa|Lag|Vlan)\S+", port_token, re.I):
                     interfaces.append(port_token)
         return interfaces
+
+    @staticmethod
+    def _expand_ports(ports_str: str) -> List[str]:
+        """Expand a comma-separated port string (without TG:/UT: markers)."""
+        result: List[str] = []
+        for token in ports_str.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            range_match = re.match(r"^([A-Za-z]+)(\d+/\d+/)(\d+)-(\d+)$", token)
+            if range_match:
+                prefix = range_match.group(1)
+                slot = range_match.group(2)
+                start = int(range_match.group(3))
+                end = int(range_match.group(4))
+                result.extend(f"{prefix}{slot}{i}" for i in range(start, end + 1))
+            elif re.match(r"^(?:Gi|Te|Fa|Lag|Vlan)\S+", token, re.I):
+                result.append(token)
+        return result
+
+    @staticmethod
+    def _parse_vlan_ports_detail(ports_raw: str) -> tuple:
+        """Parse a VLAN port segment, returning (tagged_ports, untagged_ports).
+
+        Recognises ``TG:`` and ``UT:`` prefixes within *ports_raw* and assigns
+        each port to the correct list.  Ports listed without a prefix are
+        placed in *untagged* (conservative default).
+        """
+        tagged: List[str] = []
+        untagged: List[str] = []
+
+        # re.split with a capturing group keeps the delimiters in the result list
+        parts = re.split(r"\b(TG|UT)\s*:", ports_raw, flags=re.I)
+        # parts[0] = text before first marker (usually empty or stray text)
+        # then: parts[1]=marker, parts[2]=port-list, parts[3]=marker, parts[4]=port-list, …
+        pre = parts[0].strip()
+        if pre:
+            untagged.extend(TPLinkJetstreamDriver._expand_ports(pre))
+
+        i = 1
+        while i < len(parts) - 1:
+            marker = parts[i].upper()
+            port_list = parts[i + 1]
+            ports = TPLinkJetstreamDriver._expand_ports(port_list)
+            if marker == "TG":
+                tagged.extend(ports)
+            else:
+                untagged.extend(ports)
+            i += 2
+
+        return tagged, untagged
+
+    def get_vlans_detail(self) -> Dict[str, Dict]:
+        """Return VLAN information with tagged/untagged port separation.
+
+        Returns::
+
+            {
+                "1": {"name": "System-VLAN", "tagged": ["Gi1/0/9"], "untagged": []},
+                "8": {"name": "MGMT", "tagged": ["Gi1/0/1"], "untagged": ["Gi1/0/2"]},
+            }
+        """
+        output = self._send_command("show vlan")
+        vlans: Dict[str, Dict] = {}
+        current_id: Optional[str] = None
+        in_table = False
+
+        for line in output.splitlines():
+            line_s = line.strip()
+            if not line_s:
+                continue
+            if re.match(r"^-{4,}", line_s):
+                in_table = True
+                continue
+            if not in_table:
+                continue
+
+            m = re.match(r"^(\d+)\s+(\S+)\s+\S+\s+(.*)", line_s)
+            if m:
+                current_id = str(int(m.group(1)))
+                vlan_name = m.group(2)
+                ports_raw = m.group(3).strip()
+                tagged, untagged = self._parse_vlan_ports_detail(ports_raw)
+                vlans[current_id] = {
+                    "name": vlan_name,
+                    "tagged": tagged,
+                    "untagged": untagged,
+                }
+            elif current_id is not None:
+                # Continuation line: more ports for the current VLAN
+                tagged, untagged = self._parse_vlan_ports_detail(line_s)
+                vlans[current_id]["tagged"].extend(tagged)
+                vlans[current_id]["untagged"].extend(untagged)
+
+        return vlans
 
     # ------------------------------------------------------------------
     # NAPALM configuration management

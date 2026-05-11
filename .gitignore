@@ -38,6 +38,7 @@ coverage.xml
 .idea/
 *.swp
 *~
+*.code-workspace
 
 # OS
 .DS_Store
