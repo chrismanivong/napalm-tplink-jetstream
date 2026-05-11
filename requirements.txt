@@ -1,4 +1,4 @@
 napalm>=4.0.0
-napalm-device-types>=0.1.0
+napalm_device_types>=0.1.0
 netmiko>=4.0.0
 netaddr
