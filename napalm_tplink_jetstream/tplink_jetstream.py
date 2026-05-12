@@ -824,12 +824,14 @@ class TPLinkJetstreamDriver(SwitchDriver):
         return result
 
     @staticmethod
-    def _parse_vlan_ports_detail(ports_raw: str) -> tuple:
+    def _parse_vlan_ports_detail(ports_raw: str, default_mode: str = "UT") -> tuple:
         """Parse a VLAN port segment, returning (tagged_ports, untagged_ports).
 
         Recognises ``TG:`` and ``UT:`` prefixes within *ports_raw* and assigns
         each port to the correct list.  Ports listed without a prefix are
-        placed in *untagged* (conservative default).
+        placed according to *default_mode* (``"TG"`` or ``"UT"``), which
+        allows callers to pass the last seen marker so that wrap-around
+        continuation lines are classified correctly.
         """
         tagged: List[str] = []
         untagged: List[str] = []
@@ -840,7 +842,11 @@ class TPLinkJetstreamDriver(SwitchDriver):
         # then: parts[1]=marker, parts[2]=port-list, parts[3]=marker, parts[4]=port-list, …
         pre = parts[0].strip()
         if pre:
-            untagged.extend(TPLinkJetstreamDriver._expand_ports(pre))
+            ports = TPLinkJetstreamDriver._expand_ports(pre)
+            if default_mode.upper() == "TG":
+                tagged.extend(ports)
+            else:
+                untagged.extend(ports)
 
         i = 1
         while i < len(parts) - 1:
@@ -869,6 +875,7 @@ class TPLinkJetstreamDriver(SwitchDriver):
         vlans: Dict[str, Dict] = {}
         current_id: Optional[str] = None
         in_table = False
+        last_marker = "UT"  # tracks last TG/UT seen; used for prefix-less continuation ports
 
         for line in output.splitlines():
             line_s = line.strip()
@@ -885,15 +892,23 @@ class TPLinkJetstreamDriver(SwitchDriver):
                 current_id = str(int(m.group(1)))
                 vlan_name = m.group(2)
                 ports_raw = m.group(3).strip()
-                tagged, untagged = self._parse_vlan_ports_detail(ports_raw)
+                last_marker = "UT"  # reset per VLAN
+                tagged, untagged = self._parse_vlan_ports_detail(ports_raw, last_marker)
+                # Update last_marker to whatever appeared last on this line
+                seen = re.findall(r"\b(TG|UT)\s*:", ports_raw, re.I)
+                if seen:
+                    last_marker = seen[-1].upper()
                 vlans[current_id] = {
                     "name": vlan_name,
                     "tagged": tagged,
                     "untagged": untagged,
                 }
             elif current_id is not None:
-                # Continuation line: more ports for the current VLAN
-                tagged, untagged = self._parse_vlan_ports_detail(line_s)
+                # Continuation line: inherit last_marker as default for prefix-less ports
+                tagged, untagged = self._parse_vlan_ports_detail(line_s, last_marker)
+                seen = re.findall(r"\b(TG|UT)\s*:", line_s, re.I)
+                if seen:
+                    last_marker = seen[-1].upper()
                 vlans[current_id]["tagged"].extend(tagged)
                 vlans[current_id]["untagged"].extend(untagged)
 
