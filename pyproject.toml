@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "napalm-tplink-jetstream"
-version = "0.1.0"
+version = "0.1.1"
 description = "NAPALM driver for TP-Link Jetstream managed switches"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -43,7 +43,7 @@ dev = [
 tplink_jetstream = "napalm_tplink_jetstream:TPLinkJetstreamDriver"
 
 [project.urls]
-Repository = "https://github.com/napalm-automation-community/napalm-tplink-jetstream"
+Repository = "https://github.com/chrismanivong/napalm-tplink-jetstream"
 
 [tool.setuptools.packages.find]
 where = ["."]
