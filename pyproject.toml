@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "napalm-tplink-jetstream"
-version = "0.1.1"
+version = "0.1.2"
 description = "NAPALM driver for TP-Link Jetstream managed switches"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -26,7 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "napalm>=4.0.0",
-    "napalm_device_types>=0.1.0",
+    "napalm_device_types>=0.2.0",
     "netmiko>=4.0.0",
     "netaddr",
 ]

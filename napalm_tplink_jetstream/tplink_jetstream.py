@@ -13,7 +13,7 @@
 
 """NAPALM driver for TP-Link Jetstream managed switches.
 
-Tested against: SG2210P, T1500G, T1600G, T2600G, T3700G series.
+Tested against: SG2210P, SG3210, T1500G, T1600G, T2600G, T3700G series.
 Netmiko device_type: ``tplink_jetstream``
 """
 
@@ -26,6 +26,7 @@ from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
 
 from napalm_device_types import SwitchDriver
+from napalm_device_types.models import InterfaceConfigDict, VlanConfigDict
 from napalm.base import helpers as napalm_helpers
 from napalm.base.exceptions import (
     ConnectionException,
@@ -915,6 +916,82 @@ class TPLinkJetstreamDriver(SwitchDriver):
         return vlans
 
     # ------------------------------------------------------------------
+    # VLAN write operations
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_cli_interface(port: str) -> str:
+        """Convert abbreviated port name (e.g. ``Gi1/0/1``) to CLI form (``gigabitEthernet 1/0/1``)."""
+        _PREFIX_MAP = {
+            "gi": "gigabitEthernet",
+            "te": "ten-gigabitEthernet",
+            "fa": "fastEthernet",
+            "lag": "port-channel",
+        }
+        m = re.match(r"^([A-Za-z]+)(\d.*)", port)
+        if not m:
+            return port
+        full = _PREFIX_MAP.get(m.group(1).lower(), m.group(1))
+        return f"{full} {m.group(2)}"
+
+    def delete_vlan(self, vlan_id: int) -> None:
+        """Remove a VLAN from the switch.
+
+        Before deleting, any port whose PVID is this VLAN (untagged member
+        with no other native VLAN) is moved to VLAN 1 via ``switchport pvid 1``.
+        TP-Link refuses to execute ``no vlan <id>`` while the VLAN is still
+        the PVID of at least one port.
+
+        :param vlan_id: VLAN ID (1–4094) to delete.
+        :raises ValueError: If *vlan_id* is out of the valid range.
+        :raises CommandErrorException: If the device reports an error.
+        """
+        if not 1 <= vlan_id <= 4094:
+            raise ValueError(f"VLAN ID {vlan_id} is out of range (1–4094)")
+
+        # Move untagged (PVID) ports off this VLAN before deleting it.
+        vlan_detail = self.get_vlans_detail()
+        untagged_ports = vlan_detail.get(str(vlan_id), {}).get("untagged", [])
+
+        if untagged_ports:
+            self._enter_config_mode()
+            try:
+                ep_any = self._any_prompt()
+                for port in untagged_ports:
+                    cli_iface = self._to_cli_interface(port)
+                    self.device.send_command(
+                        f"interface {cli_iface}",
+                        expect_string=ep_any,
+                        read_timeout=self.timeout,
+                    )
+                    self.device.send_command(
+                        "switchport pvid 1",
+                        expect_string=ep_any,
+                        read_timeout=self.timeout,
+                    )
+                    self.device.send_command(
+                        "exit",
+                        expect_string=ep_any,
+                        read_timeout=self.timeout,
+                    )
+            finally:
+                self._exit_config_mode()
+
+        self._enter_config_mode()
+        try:
+            out = self.device.send_command(
+                f"no vlan {vlan_id}",
+                expect_string=self._any_prompt(),
+                read_timeout=self.timeout,
+            ).strip()
+            if out and any(kw in out for kw in ("Error", "% Invalid", "% Unknown", "not exist")):
+                raise CommandErrorException(f"delete_vlan({vlan_id}): {out}")
+        finally:
+            self._exit_config_mode()
+
+        self._save_config()
+
+    # ------------------------------------------------------------------
     # NAPALM configuration management
     # ------------------------------------------------------------------
 
@@ -1483,6 +1560,52 @@ class TPLinkJetstreamDriver(SwitchDriver):
             routes.setdefault(prefix, []).append(entry)
 
         return routes
+
+    # ------------------------------------------------------------------
+    # SwitchDriver: write methods
+    # ------------------------------------------------------------------
+
+    def set_vlan(self, vlan_id: int, config: VlanConfigDict) -> None:
+        """Create or update a VLAN on the switch."""
+        self._enter_config_mode()
+        try:
+            lines = [f"vlan {vlan_id}"]
+            if "name" in config:
+                # Quote the name to handle spaces
+                lines.append(f' name "{config["name"]}"')
+            lines.append("exit")
+            errors = self._apply_config_lines("\n".join(lines))
+            if errors:
+                raise CommandErrorException(
+                    f"set_vlan({vlan_id}) errors: {errors}"
+                )
+        finally:
+            self._exit_config_mode()
+        self._save_config()
+
+    def set_interface(self, interface: str, config: InterfaceConfigDict) -> None:
+        """Configure a switch interface (mode, VLAN membership)."""
+        mode = config.get("mode")
+        iface = self._to_cli_interface(interface)
+        self._enter_config_mode()
+        try:
+            lines: List[str] = [f"interface {iface}"]
+            if mode == "trunk":
+                for vid in config.get("trunk_vlans", []):
+                    lines.append(f" switchport general allowed vlan {vid} tagged")
+            elif mode == "access":
+                if "access_vlan" in config:
+                    lines.append(f" switchport general allowed vlan {config['access_vlan']} untagged")
+                    lines.append(f" switchport general pvid {config['access_vlan']}")
+            lines.append("exit")
+            errors = self._apply_config_lines("\n".join(lines))
+            if errors:
+                raise CommandErrorException(
+                    f"set_interface({interface}) errors: {errors}"
+                )
+        finally:
+            self._exit_config_mode()
+        self._save_config()
 
     def ping(
         self,
